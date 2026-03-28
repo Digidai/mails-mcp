@@ -1,6 +1,6 @@
 {
   "name": "mails-agent-mcp",
-  "version": "1.5.0",
+  "version": "2.0.0",
   "description": "MCP Server for mails-agent — email capabilities for AI agents",
   "type": "module",
   "main": "dist/index.js",

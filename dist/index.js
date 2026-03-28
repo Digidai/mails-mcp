@@ -129,12 +129,21 @@ function sendPath() {
 function attachmentPath() {
     return useV1() ? "/v1/attachment" : "/api/attachment";
 }
+function threadsPath() {
+    return useV1() ? "/v1/threads" : "/api/threads";
+}
+function threadPath() {
+    return useV1() ? "/v1/thread" : "/api/thread";
+}
+function extractPath() {
+    return useV1() ? "/v1/extract" : "/api/extract";
+}
 // ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 const server = new McpServer({
     name: "mails-agent",
-    version: "1.5.0",
+    version: "2.0.0",
 });
 // 1. send_email
 server.tool("send_email", "Send an email from your mails-agent mailbox", {
@@ -184,12 +193,17 @@ server.tool("get_inbox", "List recent emails in your mailbox", {
         .enum(["inbound", "outbound"])
         .optional()
         .describe("Filter by email direction: inbound or outbound"),
-}, async ({ limit, query, direction }) => {
+    label: z
+        .string()
+        .optional()
+        .describe("Filter by label: newsletter, notification, code, personal"),
+}, async ({ limit, query, direction, label }) => {
     try {
         const params = withMailbox({
             limit,
             ...(query ? { query } : {}),
             ...(direction ? { direction } : {}),
+            ...(label ? { label } : {}),
         });
         const result = await apiCall("GET", inboxPath(), params);
         return {
@@ -216,9 +230,13 @@ server.tool("search_inbox", "Search emails in your mailbox by keyword", {
         .optional()
         .default(20)
         .describe("Maximum number of results to return (default 20)"),
-}, async ({ query, limit }) => {
+    label: z
+        .string()
+        .optional()
+        .describe("Filter by label: newsletter, notification, code, personal"),
+}, async ({ query, limit, label }) => {
     try {
-        const params = withMailbox({ query, limit });
+        const params = withMailbox({ query, limit, ...(label ? { label } : {}) });
         const result = await apiCall("GET", inboxPath(), params);
         return {
             content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -421,6 +439,84 @@ server.tool("get_attachment", "Download an attachment by its ID (returns text co
                     }, null, 2),
                 },
             ],
+        };
+    }
+    catch (err) {
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+                },
+            ],
+            isError: true,
+        };
+    }
+});
+// 8. get_threads
+server.tool("get_threads", "List email threads in your mailbox", {
+    limit: z
+        .number()
+        .optional()
+        .default(20)
+        .describe("Maximum number of threads to return (default 20)"),
+}, async ({ limit }) => {
+    try {
+        const params = withMailbox({ limit });
+        const result = await apiCall("GET", threadsPath(), params);
+        return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+    }
+    catch (err) {
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+                },
+            ],
+            isError: true,
+        };
+    }
+});
+// 9. get_thread
+server.tool("get_thread", "Get all emails in a specific thread", {
+    id: z.string().describe("Thread ID"),
+}, async ({ id }) => {
+    try {
+        const params = withMailbox({ id });
+        const result = await apiCall("GET", threadPath(), params);
+        return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+    }
+    catch (err) {
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+                },
+            ],
+            isError: true,
+        };
+    }
+});
+// 10. extract_data
+server.tool("extract_data", "Extract structured data from an email (order, shipping, calendar, receipt, code)", {
+    email_id: z.string().describe("Email ID to extract data from"),
+    type: z
+        .enum(["order", "shipping", "calendar", "receipt", "code"])
+        .describe("Type of data to extract"),
+}, async ({ email_id, type }) => {
+    try {
+        const result = await apiCall("POST", extractPath(), undefined, {
+            email_id,
+            type,
+        });
+        return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
     }
     catch (err) {

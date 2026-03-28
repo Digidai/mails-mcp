@@ -62,20 +62,22 @@ Send an email from your mailbox.
 
 List recent emails in your mailbox.
 
-| Parameter | Type   | Required | Description                       |
-|-----------|--------|----------|-----------------------------------|
-| limit     | number | no       | Max emails to return (default 20) |
-| query     | string | no       | Search query to filter emails     |
-| direction | string | no       | "inbound" or "outbound"           |
+| Parameter | Type   | Required | Description                                              |
+|-----------|--------|----------|----------------------------------------------------------|
+| limit     | number | no       | Max emails to return (default 20)                        |
+| query     | string | no       | Search query to filter emails                            |
+| direction | string | no       | "inbound" or "outbound"                                  |
+| label     | string | no       | Filter by label: newsletter, notification, code, personal |
 
 ### search_inbox
 
 Search emails by keyword.
 
-| Parameter | Type   | Required | Description                         |
-|-----------|--------|----------|-------------------------------------|
-| query     | string | yes      | Search query keyword                |
-| limit     | number | no       | Max results to return (default 20)  |
+| Parameter | Type   | Required | Description                                              |
+|-----------|--------|----------|----------------------------------------------------------|
+| query     | string | yes      | Search query keyword                                     |
+| limit     | number | no       | Max results to return (default 20)                       |
+| label     | string | no       | Filter by label: newsletter, notification, code, personal |
 
 ### get_email
 
@@ -109,6 +111,31 @@ Download an attachment by its ID. Returns text content inline for text-based fil
 | Parameter | Type   | Required | Description   |
 |-----------|--------|----------|---------------|
 | id        | string | yes      | Attachment ID |
+
+### get_threads
+
+List email threads in your mailbox.
+
+| Parameter | Type   | Required | Description                          |
+|-----------|--------|----------|--------------------------------------|
+| limit     | number | no       | Max threads to return (default 20)   |
+
+### get_thread
+
+Get all emails in a specific thread.
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| id        | string | yes      | Thread ID   |
+
+### extract_data
+
+Extract structured data from an email (order, shipping, calendar, receipt, code).
+
+| Parameter | Type   | Required | Description                                              |
+|-----------|--------|----------|----------------------------------------------------------|
+| email_id  | string | yes      | Email ID to extract data from                            |
+| type      | enum   | yes      | Type of data: order, shipping, calendar, receipt, code   |
 
 ## How It Works
 
