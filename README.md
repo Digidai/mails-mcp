@@ -114,6 +114,15 @@ Download an attachment by its ID. Returns text content inline for text-based fil
 
 The MCP server reads your mails-agent config from `~/.mails/config.json` and makes authenticated API calls to the mails-agent Worker API. It supports both hosted mode (`api_key` with `/v1/*` endpoints) and self-hosted mode (`worker_token` with `/api/*` endpoints).
 
+## Ecosystem
+
+| Project | Description |
+|---|---|
+| [mails](https://github.com/Digidai/mails) | Email server (Worker) + CLI + TypeScript SDK |
+| [mails-agent-mcp](https://github.com/Digidai/mails-mcp) (this repo) | MCP Server for AI agents |
+| [mails-agent (Python)](https://github.com/Digidai/mails-python) | Python SDK |
+| [mails-skills](https://github.com/Digidai/mails-skills) | Skill files for AI agents |
+
 ## License
 
 MIT
