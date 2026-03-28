@@ -76,11 +76,15 @@ function useV1(): boolean {
   return !!config.api_key;
 }
 
+/** Default fetch timeout in milliseconds (60s — covers wait_for_code's max 55s server-side) */
+const DEFAULT_TIMEOUT_MS = 60_000;
+
 async function apiCall(
   method: string,
   path: string,
   params?: Record<string, string | number | undefined>,
-  body?: unknown
+  body?: unknown,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
 ): Promise<unknown> {
   const baseUrl = getBaseUrl();
   const url = new URL(path, baseUrl);
@@ -104,7 +108,22 @@ async function apiCall(
     fetchOptions.body = JSON.stringify(body);
   }
 
-  const res = await fetch(url.toString(), fetchOptions);
+  // Abort after timeout
+  const controller = new AbortController();
+  fetchOptions.signal = controller.signal;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(url.toString(), fetchOptions);
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!res.ok) {
     let errorMessage = res.statusText;
@@ -117,7 +136,14 @@ async function apiCall(
     throw new Error(`API error (${res.status}): ${errorMessage}`);
   }
 
-  return res.json();
+  // DELETE may return empty body
+  const text = await res.text();
+  if (!text) return { ok: true };
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: true, raw: text };
+  }
 }
 
 /** Build params with mailbox scoping for public API endpoints */
@@ -142,6 +168,9 @@ function emailPath(): string {
 function sendPath(): string {
   return useV1() ? "/v1/send" : "/api/send";
 }
+function attachmentPath(): string {
+  return useV1() ? "/v1/attachment" : "/api/attachment";
+}
 
 // ---------------------------------------------------------------------------
 // MCP Server
@@ -149,7 +178,7 @@ function sendPath(): string {
 
 const server = new McpServer({
   name: "mails-agent",
-  version: "1.4.0",
+  version: "1.5.0",
 });
 
 // 1. send_email
@@ -304,11 +333,20 @@ server.tool(
       .optional()
       .default(30)
       .describe("Maximum seconds to wait for the code (default 30)"),
+    since: z
+      .string()
+      .optional()
+      .describe("Only return codes received after this ISO timestamp (e.g. 2026-03-27T10:00:00Z)"),
   },
-  async ({ timeout }) => {
+  async ({ timeout, since }) => {
     try {
-      const params = withMailbox({ timeout });
-      const result = (await apiCall("GET", codePath(), params)) as {
+      const params = withMailbox({
+        timeout,
+        ...(since ? { since } : {}),
+      });
+      // Server-side timeout up to 55s; give client extra buffer
+      const clientTimeoutMs = (Math.min(timeout, 55) + 10) * 1000;
+      const result = (await apiCall("GET", codePath(), params, undefined, clientTimeoutMs)) as {
         code: string | null;
         from?: string;
         subject?: string;
@@ -356,14 +394,19 @@ server.tool(
   },
   async ({ id }) => {
     try {
-      const url = new URL(emailPath(), getBaseUrl());
-      url.searchParams.set("id", id);
-      const headers: Record<string, string> = {
-        Authorization: `Bearer ${getToken()}`,
+      const result = await apiCall("DELETE", emailPath(), { id });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ deleted: true, id }, null, 2),
+          },
+        ],
       };
-      const res = await fetch(url.toString(), { method: "DELETE", headers });
-
-      if (res.status === 404) {
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Treat 404 as "not found" rather than error
+      if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
         return {
           content: [
             {
@@ -377,6 +420,54 @@ server.tool(
           ],
         };
       }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: ${msg}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// 7. get_attachment
+server.tool(
+  "get_attachment",
+  "Download an attachment by its ID (returns text content or download info)",
+  {
+    id: z.string().describe("Attachment ID"),
+  },
+  async ({ id }) => {
+    try {
+      const baseUrl = getBaseUrl();
+      const url = new URL(attachmentPath(), baseUrl);
+      url.searchParams.set("id", id);
+
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${getToken()}`,
+      };
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+
+      let res: Response;
+      try {
+        res = await fetch(url.toString(), {
+          method: "GET",
+          headers,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+          throw new Error(`Request timed out after ${DEFAULT_TIMEOUT_MS / 1000}s`);
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
 
       if (!res.ok) {
         let errorMessage = res.statusText;
@@ -389,11 +480,48 @@ server.tool(
         throw new Error(`API error (${res.status}): ${errorMessage}`);
       }
 
+      const contentType = res.headers.get("Content-Type") || "application/octet-stream";
+      const disposition = res.headers.get("Content-Disposition") || "";
+
+      // For text-based content, return the body as text
+      if (contentType.startsWith("text/") || contentType.includes("json") || contentType.includes("xml")) {
+        const text = await res.text();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  id,
+                  content_type: contentType,
+                  disposition,
+                  content: text,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      // For binary content, return metadata only
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ deleted: true, id }, null, 2),
+            text: JSON.stringify(
+              {
+                id,
+                content_type: contentType,
+                disposition,
+                message:
+                  "Binary attachment. Use the download URL directly or get_email to see attachment details.",
+                download_url: url.toString().replace(/Bearer\s+\S+/, "***"),
+              },
+              null,
+              2
+            ),
           },
         ],
       };

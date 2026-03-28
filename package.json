@@ -1,6 +1,6 @@
 {
   "name": "mails-agent-mcp",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "MCP Server for mails-agent — email capabilities for AI agents",
   "type": "module",
   "main": "dist/index.js",
@@ -24,7 +24,8 @@
   "author": "Gene Dai",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0"
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.25.0"
   },
   "files": [
     "dist"

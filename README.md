@@ -89,9 +89,10 @@ Get full details of a specific email by ID.
 
 Wait for a verification code email to arrive. Polls until a code is received or timeout is reached.
 
-| Parameter | Type   | Required | Description                             |
-|-----------|--------|----------|-----------------------------------------|
-| timeout   | number | no       | Max seconds to wait (default 30)        |
+| Parameter | Type   | Required | Description                                                          |
+|-----------|--------|----------|----------------------------------------------------------------------|
+| timeout   | number | no       | Max seconds to wait (default 30)                                     |
+| since     | string | no       | Only return codes received after this ISO timestamp (e.g. 2026-03-27T10:00:00Z) |
 
 ### delete_email
 
@@ -100,6 +101,14 @@ Delete an email by ID.
 | Parameter | Type   | Required | Description        |
 |-----------|--------|----------|--------------------|
 | id        | string | yes      | Email ID to delete |
+
+### get_attachment
+
+Download an attachment by its ID. Returns text content inline for text-based files, or metadata for binary files.
+
+| Parameter | Type   | Required | Description   |
+|-----------|--------|----------|---------------|
+| id        | string | yes      | Attachment ID |
 
 ## How It Works
 
