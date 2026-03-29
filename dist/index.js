@@ -143,7 +143,7 @@ function extractPath() {
 // ---------------------------------------------------------------------------
 const server = new McpServer({
     name: "mails-agent",
-    version: "2.0.0",
+    version: "2.1.0",
 });
 // 1. send_email
 server.tool("send_email", "Send an email from your mails-agent mailbox", {
@@ -197,13 +197,18 @@ server.tool("get_inbox", "List recent emails in your mailbox", {
         .string()
         .optional()
         .describe("Filter by label: newsletter, notification, code, personal"),
-}, async ({ limit, query, direction, label }) => {
+    mode: z
+        .enum(["keyword", "semantic", "hybrid"])
+        .optional()
+        .describe("Search mode: keyword (FTS5), semantic (vector), hybrid (both). Default: keyword"),
+}, async ({ limit, query, direction, label, mode }) => {
     try {
         const params = withMailbox({
             limit,
             ...(query ? { query } : {}),
             ...(direction ? { direction } : {}),
             ...(label ? { label } : {}),
+            ...(mode ? { mode } : {}),
         });
         const result = await apiCall("GET", inboxPath(), params);
         return {
@@ -223,7 +228,7 @@ server.tool("get_inbox", "List recent emails in your mailbox", {
     }
 });
 // 3. search_inbox
-server.tool("search_inbox", "Search emails in your mailbox by keyword", {
+server.tool("search_inbox", "Search emails in your mailbox by keyword, semantic similarity, or hybrid", {
     query: z.string().describe("Search query keyword"),
     limit: z
         .number()
@@ -234,9 +239,13 @@ server.tool("search_inbox", "Search emails in your mailbox by keyword", {
         .string()
         .optional()
         .describe("Filter by label: newsletter, notification, code, personal"),
-}, async ({ query, limit, label }) => {
+    mode: z
+        .enum(["keyword", "semantic", "hybrid"])
+        .optional()
+        .describe("Search mode: keyword (FTS5), semantic (vector), hybrid (both). Default: keyword"),
+}, async ({ query, limit, label, mode }) => {
     try {
-        const params = withMailbox({ query, limit, ...(label ? { label } : {}) });
+        const params = withMailbox({ query, limit, ...(label ? { label } : {}), ...(mode ? { mode } : {}) });
         const result = await apiCall("GET", inboxPath(), params);
         return {
             content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

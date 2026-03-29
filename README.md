@@ -68,16 +68,18 @@ List recent emails in your mailbox.
 | query     | string | no       | Search query to filter emails                            |
 | direction | string | no       | "inbound" or "outbound"                                  |
 | label     | string | no       | Filter by label: newsletter, notification, code, personal |
+| mode      | enum   | no       | Search mode: "keyword" (FTS5), "semantic" (vector), "hybrid" (both). Default: "keyword" |
 
 ### search_inbox
 
-Search emails by keyword.
+Search emails by keyword, semantic similarity, or hybrid.
 
 | Parameter | Type   | Required | Description                                              |
 |-----------|--------|----------|----------------------------------------------------------|
 | query     | string | yes      | Search query keyword                                     |
 | limit     | number | no       | Max results to return (default 20)                       |
 | label     | string | no       | Filter by label: newsletter, notification, code, personal |
+| mode      | enum   | no       | Search mode: "keyword" (FTS5), "semantic" (vector), "hybrid" (both). Default: "keyword" |
 
 ### get_email
 
