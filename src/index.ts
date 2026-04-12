@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
 import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -11,7 +13,7 @@ import { z } from "zod";
 // Config
 // ---------------------------------------------------------------------------
 
-interface MailsConfig {
+export interface MailsConfig {
   worker_url?: string;
   worker_token?: string;
   api_key?: string;
@@ -21,7 +23,7 @@ interface MailsConfig {
 
 const CONFIG_PATH = join(homedir(), ".mails", "config.json");
 
-function loadConfig(): MailsConfig {
+export function loadConfig(): MailsConfig {
   if (!existsSync(CONFIG_PATH)) {
     throw new Error(
       "mails-agent not configured. Run: npm install -g mails-agent && mails claim <name>"
@@ -35,21 +37,26 @@ function loadConfig(): MailsConfig {
 // HTTP helper
 // ---------------------------------------------------------------------------
 
-let _config: MailsConfig | null = null;
+export let _config: MailsConfig | null = null;
 
-function getConfig(): MailsConfig {
+/** Reset cached config (for testing) */
+export function resetConfig(): void {
+  _config = null;
+}
+
+export function getConfig(): MailsConfig {
   if (!_config) {
     _config = loadConfig();
   }
   return _config;
 }
 
-function getBaseUrl(): string {
+export function getBaseUrl(): string {
   const config = getConfig();
   return config.worker_url || "https://mails-worker.genedai.workers.dev";
 }
 
-function getToken(): string {
+export function getToken(): string {
   const config = getConfig();
   const token = config.api_key || config.worker_token;
   if (!token) {
@@ -60,7 +67,7 @@ function getToken(): string {
   return token;
 }
 
-function getMailbox(): string {
+export function getMailbox(): string {
   const config = getConfig();
   const mailbox = config.mailbox || config.default_from;
   if (!mailbox) {
@@ -71,24 +78,120 @@ function getMailbox(): string {
   return mailbox;
 }
 
-function useV1(): boolean {
+export function useV1(): boolean {
   const config = getConfig();
   return !!config.api_key;
+}
+
+// ---------------------------------------------------------------------------
+// Logging (structured, to stderr, with redaction)
+// ---------------------------------------------------------------------------
+
+type LogLevel = "info" | "warn" | "error";
+
+/**
+ * Structured log to stderr. Never logs tokens, email bodies, or addresses.
+ * Only logs: method, path, status codes, retry events, error messages.
+ */
+export function log(level: LogLevel, message: string, extra?: Record<string, unknown>): void {
+  const entry: Record<string, unknown> = {
+    ts: new Date().toISOString(),
+    level,
+    msg: message,
+    ...extra,
+  };
+  process.stderr.write(JSON.stringify(entry) + "\n");
 }
 
 /** Default fetch timeout in milliseconds (60s — covers wait_for_code's max 55s server-side) */
 const DEFAULT_TIMEOUT_MS = 60_000;
 
-async function apiCall(
+/**
+ * Low-level fetch with timeout, auth, and optional retry.
+ * Returns the raw Response.
+ *
+ * Retry is only attempted for GET requests when `retry` is true.
+ * Max 2 retries with exponential backoff (500ms, 1500ms).
+ * Only retries on network errors and 5xx responses (not 4xx).
+ */
+export async function fetchWithTimeout(
   method: string,
-  path: string,
-  params?: Record<string, string | number | undefined>,
-  body?: unknown,
-  timeoutMs: number = DEFAULT_TIMEOUT_MS
-): Promise<unknown> {
-  const baseUrl = getBaseUrl();
-  const url = new URL(path, baseUrl);
+  url: URL,
+  options?: { body?: unknown; timeoutMs?: number; retry?: boolean }
+): Promise<Response> {
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxAttempts = options?.retry ? 3 : 1;
 
+  let lastError: Error | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${getToken()}`,
+    };
+
+    const fetchOptions: RequestInit = { method, headers };
+
+    if (options?.body) {
+      headers["Content-Type"] = "application/json";
+      fetchOptions.body = JSON.stringify(options.body);
+    }
+
+    const controller = new AbortController();
+    fetchOptions.signal = controller.signal;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(url.toString(), fetchOptions);
+      if (!res.ok) {
+        let errorMessage = res.statusText;
+        try {
+          const data = (await res.json()) as { error?: string };
+          if (data.error) errorMessage = data.error;
+        } catch {
+          // ignore JSON parse errors
+        }
+        const err = new Error(`API error (${res.status}): ${errorMessage}`);
+        // Retry on 5xx only
+        if (res.status >= 500 && attempt < maxAttempts) {
+          lastError = err;
+          log("warn", `Retry ${attempt}/${maxAttempts - 1} after ${res.status} for ${method} ${url.pathname}`);
+          await sleep(attempt === 1 ? 500 : 1500);
+          continue;
+        }
+        throw err;
+      }
+      return res;
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
+      }
+      // Retry on network errors (TypeError from fetch)
+      if (err instanceof TypeError && attempt < maxAttempts) {
+        lastError = err;
+        log("warn", `Retry ${attempt}/${maxAttempts - 1} after network error for ${method} ${url.pathname}`);
+        await sleep(attempt === 1 ? 500 : 1500);
+        continue;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Should not reach here, but satisfy TypeScript
+  throw lastError ?? new Error("Request failed after retries");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Build a full URL with query params for the mails API */
+export function buildUrl(
+  path: string,
+  params?: Record<string, string | number | undefined>
+): URL {
+  const url = new URL(path, getBaseUrl());
   if (params) {
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== null) {
@@ -96,45 +199,19 @@ async function apiCall(
       }
     }
   }
+  return url;
+}
 
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${getToken()}`,
-  };
-
-  const fetchOptions: RequestInit = { method, headers };
-
-  if (body) {
-    headers["Content-Type"] = "application/json";
-    fetchOptions.body = JSON.stringify(body);
-  }
-
-  // Abort after timeout
-  const controller = new AbortController();
-  fetchOptions.signal = controller.signal;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  let res: Response;
-  try {
-    res = await fetch(url.toString(), fetchOptions);
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-
-  if (!res.ok) {
-    let errorMessage = res.statusText;
-    try {
-      const data = (await res.json()) as { error?: string };
-      if (data.error) errorMessage = data.error;
-    } catch {
-      // ignore JSON parse errors
-    }
-    throw new Error(`API error (${res.status}): ${errorMessage}`);
-  }
+export async function apiCall(
+  method: string,
+  path: string,
+  params?: Record<string, string | number | undefined>,
+  body?: unknown,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  retry: boolean = false
+): Promise<unknown> {
+  const url = buildUrl(path, params);
+  const res = await fetchWithTimeout(method, url, { body, timeoutMs, retry });
 
   // DELETE may return empty body
   const text = await res.text();
@@ -147,7 +224,7 @@ async function apiCall(
 }
 
 /** Build params with mailbox scoping for public API endpoints */
-function withMailbox(
+export function withMailbox(
   params: Record<string, string | number | undefined>
 ): Record<string, string | number | undefined> {
   if (!useV1()) {
@@ -182,12 +259,39 @@ function extractPath(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Tool response helpers
+// ---------------------------------------------------------------------------
+
+/** Format a successful tool result as JSON text */
+export function toolResult(data: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+  };
+}
+
+/** Format an error tool result */
+export function toolError(err: unknown) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    ],
+    isError: true,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({
+const _require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = _require("../package.json") as { version: string };
+
+export const server = new McpServer({
   name: "mails-agent",
-  version: "2.1.0",
+  version: PKG_VERSION,
 });
 
 // 1. send_email
@@ -211,19 +315,9 @@ server.tool(
       if (html) sendBody.html = html;
 
       const result = await apiCall("POST", sendPath(), undefined, sendBody);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      return toolResult(result);
     } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -257,27 +351,11 @@ server.tool(
   },
   async ({ limit, query, direction, label, mode }) => {
     try {
-      const params = withMailbox({
-        limit,
-        ...(query ? { query } : {}),
-        ...(direction ? { direction } : {}),
-        ...(label ? { label } : {}),
-        ...(mode ? { mode } : {}),
-      });
-      const result = await apiCall("GET", inboxPath(), params);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      const params = withMailbox({ limit, query, direction, label, mode });
+      const result = await apiCall("GET", inboxPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
+      return toolResult(result);
     } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -304,21 +382,11 @@ server.tool(
   },
   async ({ query, limit, label, mode }) => {
     try {
-      const params = withMailbox({ query, limit, ...(label ? { label } : {}), ...(mode ? { mode } : {}) });
-      const result = await apiCall("GET", inboxPath(), params);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      const params = withMailbox({ query, limit, label, mode });
+      const result = await apiCall("GET", inboxPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
+      return toolResult(result);
     } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -332,20 +400,10 @@ server.tool(
   },
   async ({ id }) => {
     try {
-      const result = await apiCall("GET", emailPath(), { id });
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      const result = await apiCall("GET", emailPath(), { id }, undefined, DEFAULT_TIMEOUT_MS, true);
+      return toolResult(result);
     } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -367,10 +425,7 @@ server.tool(
   },
   async ({ timeout, since }) => {
     try {
-      const params = withMailbox({
-        timeout,
-        ...(since ? { since } : {}),
-      });
+      const params = withMailbox({ timeout, since });
       // Server-side timeout up to 55s; give client extra buffer
       const clientTimeoutMs = (Math.min(timeout, 55) + 10) * 1000;
       const result = (await apiCall("GET", codePath(), params, undefined, clientTimeoutMs)) as {
@@ -379,35 +434,11 @@ server.tool(
         subject?: string;
       };
       if (!result.code) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  code: null,
-                  message: "No code received within timeout",
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return toolResult({ code: null, message: "No code received within timeout" });
       }
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      return toolResult(result);
     } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -421,41 +452,15 @@ server.tool(
   },
   async ({ id }) => {
     try {
-      const result = await apiCall("DELETE", emailPath(), { id });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ deleted: true, id }, null, 2),
-          },
-        ],
-      };
+      await apiCall("DELETE", emailPath(), { id });
+      return toolResult({ deleted: true, id });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Treat 404 as "not found" rather than error
       if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                { deleted: false, message: "Email not found" },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return toolResult({ deleted: false, message: "Email not found" });
       }
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${msg}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -469,43 +474,8 @@ server.tool(
   },
   async ({ id }) => {
     try {
-      const baseUrl = getBaseUrl();
-      const url = new URL(attachmentPath(), baseUrl);
-      url.searchParams.set("id", id);
-
-      const headers: Record<string, string> = {
-        Authorization: `Bearer ${getToken()}`,
-      };
-
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
-
-      let res: Response;
-      try {
-        res = await fetch(url.toString(), {
-          method: "GET",
-          headers,
-          signal: controller.signal,
-        });
-      } catch (err) {
-        if (err instanceof Error && err.name === "AbortError") {
-          throw new Error(`Request timed out after ${DEFAULT_TIMEOUT_MS / 1000}s`);
-        }
-        throw err;
-      } finally {
-        clearTimeout(timer);
-      }
-
-      if (!res.ok) {
-        let errorMessage = res.statusText;
-        try {
-          const data = (await res.json()) as { error?: string };
-          if (data.error) errorMessage = data.error;
-        } catch {
-          // ignore
-        }
-        throw new Error(`API error (${res.status}): ${errorMessage}`);
-      }
+      const url = buildUrl(attachmentPath(), { id });
+      const res = await fetchWithTimeout("GET", url);
 
       const contentType = res.headers.get("Content-Type") || "application/octet-stream";
       const disposition = res.headers.get("Content-Disposition") || "";
@@ -513,55 +483,19 @@ server.tool(
       // For text-based content, return the body as text
       if (contentType.startsWith("text/") || contentType.includes("json") || contentType.includes("xml")) {
         const text = await res.text();
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  id,
-                  content_type: contentType,
-                  disposition,
-                  content: text,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return toolResult({ id, content_type: contentType, disposition, content: text });
       }
 
       // For binary content, return metadata only
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                id,
-                content_type: contentType,
-                disposition,
-                message:
-                  "Binary attachment. Use the download URL directly or get_email to see attachment details.",
-                download_url: url.toString().replace(/Bearer\s+\S+/, "***"),
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      return toolResult({
+        id,
+        content_type: contentType,
+        disposition,
+        message:
+          "Binary attachment. Use the download URL directly or get_email to see attachment details.",
+      });
     } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -580,20 +514,10 @@ server.tool(
   async ({ limit }) => {
     try {
       const params = withMailbox({ limit });
-      const result = await apiCall("GET", threadsPath(), params);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      const result = await apiCall("GET", threadsPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
+      return toolResult(result);
     } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -608,20 +532,10 @@ server.tool(
   async ({ id }) => {
     try {
       const params = withMailbox({ id });
-      const result = await apiCall("GET", threadPath(), params);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      const result = await apiCall("GET", threadPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
+      return toolResult(result);
     } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -642,19 +556,9 @@ server.tool(
         email_id,
         type,
       });
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
+      return toolResult(result);
     } catch (err) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-          },
-        ],
-        isError: true,
-      };
+      return toolError(err);
     }
   }
 );
@@ -663,12 +567,15 @@ server.tool(
 // Start
 // ---------------------------------------------------------------------------
 
-async function main() {
+export async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+// Only start when executed directly (not imported for testing)
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  });
+}
