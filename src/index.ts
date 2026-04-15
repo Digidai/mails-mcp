@@ -53,7 +53,7 @@ export function getConfig(): MailsConfig {
 
 export function getBaseUrl(): string {
   const config = getConfig();
-  return config.worker_url || "https://mails-worker.genedai.workers.dev";
+  return config.worker_url || "https://api.mails0.com";
 }
 
 export function getToken(): string {

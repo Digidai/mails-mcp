@@ -96,7 +96,7 @@ describe("getBaseUrl", () => {
 
   it("returns default when no worker_url", () => {
     setConfig({ api_key: "k", mailbox: "m" });
-    expect(getBaseUrl()).toBe("https://mails-worker.genedai.workers.dev");
+    expect(getBaseUrl()).toBe("https://api.mails0.com");
   });
 });
 
