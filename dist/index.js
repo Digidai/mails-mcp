@@ -2,11 +2,13 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 const CONFIG_PATH = join(homedir(), ".mails", "config.json");
-function loadConfig() {
+export function loadConfig() {
     if (!existsSync(CONFIG_PATH)) {
         throw new Error("mails-agent not configured. Run: npm install -g mails-agent && mails claim <name>");
     }
@@ -16,18 +18,22 @@ function loadConfig() {
 // ---------------------------------------------------------------------------
 // HTTP helper
 // ---------------------------------------------------------------------------
-let _config = null;
-function getConfig() {
+export let _config = null;
+/** Reset cached config (for testing) */
+export function resetConfig() {
+    _config = null;
+}
+export function getConfig() {
     if (!_config) {
         _config = loadConfig();
     }
     return _config;
 }
-function getBaseUrl() {
+export function getBaseUrl() {
     const config = getConfig();
-    return config.worker_url || "https://mails-worker.genedai.workers.dev";
+    return config.worker_url || "https://api.mails0.com";
 }
-function getToken() {
+export function getToken() {
     const config = getConfig();
     const token = config.api_key || config.worker_token;
     if (!token) {
@@ -35,7 +41,7 @@ function getToken() {
     }
     return token;
 }
-function getMailbox() {
+export function getMailbox() {
     const config = getConfig();
     const mailbox = config.mailbox || config.default_from;
     if (!mailbox) {
@@ -43,15 +49,99 @@ function getMailbox() {
     }
     return mailbox;
 }
-function useV1() {
+export function useV1() {
     const config = getConfig();
     return !!config.api_key;
 }
+/**
+ * Structured log to stderr. Never logs tokens, email bodies, or addresses.
+ * Only logs: method, path, status codes, retry events, error messages.
+ */
+export function log(level, message, extra) {
+    const entry = {
+        ts: new Date().toISOString(),
+        level,
+        msg: message,
+        ...extra,
+    };
+    process.stderr.write(JSON.stringify(entry) + "\n");
+}
 /** Default fetch timeout in milliseconds (60s — covers wait_for_code's max 55s server-side) */
 const DEFAULT_TIMEOUT_MS = 60_000;
-async function apiCall(method, path, params, body, timeoutMs = DEFAULT_TIMEOUT_MS) {
-    const baseUrl = getBaseUrl();
-    const url = new URL(path, baseUrl);
+/**
+ * Low-level fetch with timeout, auth, and optional retry.
+ * Returns the raw Response.
+ *
+ * Retry is only attempted for GET requests when `retry` is true.
+ * Max 2 retries with exponential backoff (500ms, 1500ms).
+ * Only retries on network errors and 5xx responses (not 4xx).
+ */
+export async function fetchWithTimeout(method, url, options) {
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const maxAttempts = options?.retry ? 3 : 1;
+    let lastError;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const headers = {
+            Authorization: `Bearer ${getToken()}`,
+        };
+        const fetchOptions = { method, headers };
+        if (options?.body) {
+            headers["Content-Type"] = "application/json";
+            fetchOptions.body = JSON.stringify(options.body);
+        }
+        const controller = new AbortController();
+        fetchOptions.signal = controller.signal;
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const res = await fetch(url.toString(), fetchOptions);
+            if (!res.ok) {
+                let errorMessage = res.statusText;
+                try {
+                    const data = (await res.json());
+                    if (data.error)
+                        errorMessage = data.error;
+                }
+                catch {
+                    // ignore JSON parse errors
+                }
+                const err = new Error(`API error (${res.status}): ${errorMessage}`);
+                // Retry on 5xx only
+                if (res.status >= 500 && attempt < maxAttempts) {
+                    lastError = err;
+                    log("warn", `Retry ${attempt}/${maxAttempts - 1} after ${res.status} for ${method} ${url.pathname}`);
+                    await sleep(attempt === 1 ? 500 : 1500);
+                    continue;
+                }
+                throw err;
+            }
+            return res;
+        }
+        catch (err) {
+            if (err instanceof Error && err.name === "AbortError") {
+                throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
+            }
+            // Retry on network errors (TypeError from fetch)
+            if (err instanceof TypeError && attempt < maxAttempts) {
+                lastError = err;
+                log("warn", `Retry ${attempt}/${maxAttempts - 1} after network error for ${method} ${url.pathname}`);
+                await sleep(attempt === 1 ? 500 : 1500);
+                continue;
+            }
+            throw err;
+        }
+        finally {
+            clearTimeout(timer);
+        }
+    }
+    // Should not reach here, but satisfy TypeScript
+    throw lastError ?? new Error("Request failed after retries");
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/** Build a full URL with query params for the mails API */
+export function buildUrl(path, params) {
+    const url = new URL(path, getBaseUrl());
     if (params) {
         for (const [k, v] of Object.entries(params)) {
             if (v !== undefined && v !== null) {
@@ -59,43 +149,11 @@ async function apiCall(method, path, params, body, timeoutMs = DEFAULT_TIMEOUT_M
             }
         }
     }
-    const headers = {
-        Authorization: `Bearer ${getToken()}`,
-    };
-    const fetchOptions = { method, headers };
-    if (body) {
-        headers["Content-Type"] = "application/json";
-        fetchOptions.body = JSON.stringify(body);
-    }
-    // Abort after timeout
-    const controller = new AbortController();
-    fetchOptions.signal = controller.signal;
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let res;
-    try {
-        res = await fetch(url.toString(), fetchOptions);
-    }
-    catch (err) {
-        if (err instanceof Error && err.name === "AbortError") {
-            throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
-        }
-        throw err;
-    }
-    finally {
-        clearTimeout(timer);
-    }
-    if (!res.ok) {
-        let errorMessage = res.statusText;
-        try {
-            const data = (await res.json());
-            if (data.error)
-                errorMessage = data.error;
-        }
-        catch {
-            // ignore JSON parse errors
-        }
-        throw new Error(`API error (${res.status}): ${errorMessage}`);
-    }
+    return url;
+}
+export async function apiCall(method, path, params, body, timeoutMs = DEFAULT_TIMEOUT_MS, retry = false) {
+    const url = buildUrl(path, params);
+    const res = await fetchWithTimeout(method, url, { body, timeoutMs, retry });
     // DELETE may return empty body
     const text = await res.text();
     if (!text)
@@ -108,7 +166,7 @@ async function apiCall(method, path, params, body, timeoutMs = DEFAULT_TIMEOUT_M
     }
 }
 /** Build params with mailbox scoping for public API endpoints */
-function withMailbox(params) {
+export function withMailbox(params) {
     if (!useV1()) {
         params.to = getMailbox();
     }
@@ -139,11 +197,34 @@ function extractPath() {
     return useV1() ? "/v1/extract" : "/api/extract";
 }
 // ---------------------------------------------------------------------------
+// Tool response helpers
+// ---------------------------------------------------------------------------
+/** Format a successful tool result as JSON text */
+export function toolResult(data) {
+    return {
+        content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+    };
+}
+/** Format an error tool result */
+export function toolError(err) {
+    return {
+        content: [
+            {
+                type: "text",
+                text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+        ],
+        isError: true,
+    };
+}
+// ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
-const server = new McpServer({
+const _require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = _require("../package.json");
+export const server = new McpServer({
     name: "mails-agent",
-    version: "2.1.0",
+    version: PKG_VERSION,
 });
 // 1. send_email
 server.tool("send_email", "Send an email from your mails-agent mailbox", {
@@ -162,20 +243,10 @@ server.tool("send_email", "Send an email from your mails-agent mailbox", {
         if (html)
             sendBody.html = html;
         const result = await apiCall("POST", sendPath(), undefined, sendBody);
-        return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        return toolResult(result);
     }
     catch (err) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // 2. get_inbox
@@ -203,28 +274,12 @@ server.tool("get_inbox", "List recent emails in your mailbox", {
         .describe("Search mode: keyword (FTS5), semantic (vector), hybrid (both). Default: keyword"),
 }, async ({ limit, query, direction, label, mode }) => {
     try {
-        const params = withMailbox({
-            limit,
-            ...(query ? { query } : {}),
-            ...(direction ? { direction } : {}),
-            ...(label ? { label } : {}),
-            ...(mode ? { mode } : {}),
-        });
-        const result = await apiCall("GET", inboxPath(), params);
-        return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        const params = withMailbox({ limit, query, direction, label, mode });
+        const result = await apiCall("GET", inboxPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
+        return toolResult(result);
     }
     catch (err) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // 3. search_inbox
@@ -245,22 +300,12 @@ server.tool("search_inbox", "Search emails in your mailbox by keyword, semantic 
         .describe("Search mode: keyword (FTS5), semantic (vector), hybrid (both). Default: keyword"),
 }, async ({ query, limit, label, mode }) => {
     try {
-        const params = withMailbox({ query, limit, ...(label ? { label } : {}), ...(mode ? { mode } : {}) });
-        const result = await apiCall("GET", inboxPath(), params);
-        return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        const params = withMailbox({ query, limit, label, mode });
+        const result = await apiCall("GET", inboxPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
+        return toolResult(result);
     }
     catch (err) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // 4. get_email
@@ -268,21 +313,11 @@ server.tool("get_email", "Get full details of a specific email by its ID", {
     id: z.string().describe("Email ID"),
 }, async ({ id }) => {
     try {
-        const result = await apiCall("GET", emailPath(), { id });
-        return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        const result = await apiCall("GET", emailPath(), { id }, undefined, DEFAULT_TIMEOUT_MS, true);
+        return toolResult(result);
     }
     catch (err) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // 5. wait_for_code
@@ -298,40 +333,17 @@ server.tool("wait_for_code", "Wait for a verification code email to arrive (poll
         .describe("Only return codes received after this ISO timestamp (e.g. 2026-03-27T10:00:00Z)"),
 }, async ({ timeout, since }) => {
     try {
-        const params = withMailbox({
-            timeout,
-            ...(since ? { since } : {}),
-        });
+        const params = withMailbox({ timeout, since });
         // Server-side timeout up to 55s; give client extra buffer
         const clientTimeoutMs = (Math.min(timeout, 55) + 10) * 1000;
         const result = (await apiCall("GET", codePath(), params, undefined, clientTimeoutMs));
         if (!result.code) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify({
-                            code: null,
-                            message: "No code received within timeout",
-                        }, null, 2),
-                    },
-                ],
-            };
+            return toolResult({ code: null, message: "No code received within timeout" });
         }
-        return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        return toolResult(result);
     }
     catch (err) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // 6. delete_email
@@ -339,38 +351,16 @@ server.tool("delete_email", "Delete an email by its ID", {
     id: z.string().describe("Email ID to delete"),
 }, async ({ id }) => {
     try {
-        const result = await apiCall("DELETE", emailPath(), { id });
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: JSON.stringify({ deleted: true, id }, null, 2),
-                },
-            ],
-        };
+        await apiCall("DELETE", emailPath(), { id });
+        return toolResult({ deleted: true, id });
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         // Treat 404 as "not found" rather than error
         if (msg.includes("404") || msg.toLowerCase().includes("not found")) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify({ deleted: false, message: "Email not found" }, null, 2),
-                    },
-                ],
-            };
+            return toolResult({ deleted: false, message: "Email not found" });
         }
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${msg}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // 7. get_attachment
@@ -378,88 +368,25 @@ server.tool("get_attachment", "Download an attachment by its ID (returns text co
     id: z.string().describe("Attachment ID"),
 }, async ({ id }) => {
     try {
-        const baseUrl = getBaseUrl();
-        const url = new URL(attachmentPath(), baseUrl);
-        url.searchParams.set("id", id);
-        const headers = {
-            Authorization: `Bearer ${getToken()}`,
-        };
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
-        let res;
-        try {
-            res = await fetch(url.toString(), {
-                method: "GET",
-                headers,
-                signal: controller.signal,
-            });
-        }
-        catch (err) {
-            if (err instanceof Error && err.name === "AbortError") {
-                throw new Error(`Request timed out after ${DEFAULT_TIMEOUT_MS / 1000}s`);
-            }
-            throw err;
-        }
-        finally {
-            clearTimeout(timer);
-        }
-        if (!res.ok) {
-            let errorMessage = res.statusText;
-            try {
-                const data = (await res.json());
-                if (data.error)
-                    errorMessage = data.error;
-            }
-            catch {
-                // ignore
-            }
-            throw new Error(`API error (${res.status}): ${errorMessage}`);
-        }
+        const url = buildUrl(attachmentPath(), { id });
+        const res = await fetchWithTimeout("GET", url);
         const contentType = res.headers.get("Content-Type") || "application/octet-stream";
         const disposition = res.headers.get("Content-Disposition") || "";
         // For text-based content, return the body as text
         if (contentType.startsWith("text/") || contentType.includes("json") || contentType.includes("xml")) {
             const text = await res.text();
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: JSON.stringify({
-                            id,
-                            content_type: contentType,
-                            disposition,
-                            content: text,
-                        }, null, 2),
-                    },
-                ],
-            };
+            return toolResult({ id, content_type: contentType, disposition, content: text });
         }
         // For binary content, return metadata only
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: JSON.stringify({
-                        id,
-                        content_type: contentType,
-                        disposition,
-                        message: "Binary attachment. Use the download URL directly or get_email to see attachment details.",
-                        download_url: url.toString().replace(/Bearer\s+\S+/, "***"),
-                    }, null, 2),
-                },
-            ],
-        };
+        return toolResult({
+            id,
+            content_type: contentType,
+            disposition,
+            message: "Binary attachment. Use the download URL directly or get_email to see attachment details.",
+        });
     }
     catch (err) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // 8. get_threads
@@ -472,21 +399,11 @@ server.tool("get_threads", "List email threads in your mailbox", {
 }, async ({ limit }) => {
     try {
         const params = withMailbox({ limit });
-        const result = await apiCall("GET", threadsPath(), params);
-        return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        const result = await apiCall("GET", threadsPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
+        return toolResult(result);
     }
     catch (err) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // 9. get_thread
@@ -495,21 +412,11 @@ server.tool("get_thread", "Get all emails in a specific thread", {
 }, async ({ id }) => {
     try {
         const params = withMailbox({ id });
-        const result = await apiCall("GET", threadPath(), params);
-        return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        const result = await apiCall("GET", threadPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
+        return toolResult(result);
     }
     catch (err) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // 10. extract_data
@@ -524,30 +431,23 @@ server.tool("extract_data", "Extract structured data from an email (order, shipp
             email_id,
             type,
         });
-        return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        };
+        return toolResult(result);
     }
     catch (err) {
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-                },
-            ],
-            isError: true,
-        };
+        return toolError(err);
     }
 });
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
-async function main() {
+export async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 }
-main().catch((err) => {
-    console.error("Fatal error:", err);
-    process.exit(1);
-});
+// Only start when executed directly (not imported for testing)
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+    main().catch((err) => {
+        console.error("Fatal error:", err);
+        process.exit(1);
+    });
+}
