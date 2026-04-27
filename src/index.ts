@@ -258,6 +258,22 @@ function extractPath(): string {
   return useV1() ? "/v1/extract" : "/api/extract";
 }
 
+const emailListSchema = z
+  .union([z.string(), z.array(z.string()).min(1)])
+  .describe("Email address or list of email addresses");
+
+const attachmentSchema = z.object({
+  filename: z.string().min(1).describe("Attachment filename"),
+  content: z.string().describe("Base64-encoded attachment content"),
+  content_type: z.string().optional().describe("MIME type, for example application/pdf"),
+  content_id: z.string().optional().describe("Optional content ID for inline attachments"),
+});
+
+function normalizeEmailList(value: string | string[] | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  return Array.isArray(value) ? value : [value];
+}
+
 // ---------------------------------------------------------------------------
 // Tool response helpers
 // ---------------------------------------------------------------------------
@@ -299,20 +315,38 @@ server.tool(
   "send_email",
   "Send an email from your mails-agent mailbox",
   {
-    to: z.string().describe("Recipient email address"),
+    to: emailListSchema,
+    cc: emailListSchema.optional().describe("CC recipient email address or addresses"),
+    bcc: emailListSchema.optional().describe("BCC recipient email address or addresses"),
     subject: z.string().describe("Email subject line"),
     body: z.string().describe("Plain text email body"),
     html: z.string().optional().describe("Optional HTML email body"),
+    reply_to: z.string().optional().describe("Optional Reply-To email address"),
+    in_reply_to: z
+      .string()
+      .optional()
+      .describe("Message-ID being replied to, used for email threading"),
+    attachments: z
+      .array(attachmentSchema)
+      .optional()
+      .describe("Optional base64-encoded attachments"),
   },
-  async ({ to, subject, body, html }) => {
+  async ({ to, cc, bcc, subject, body, html, reply_to, in_reply_to, attachments }) => {
     try {
       const sendBody: Record<string, unknown> = {
         from: getMailbox(),
-        to: [to],
+        to: normalizeEmailList(to),
         subject,
         text: body,
       };
       if (html) sendBody.html = html;
+      const normalizedCc = normalizeEmailList(cc);
+      const normalizedBcc = normalizeEmailList(bcc);
+      if (normalizedCc?.length) sendBody.cc = normalizedCc;
+      if (normalizedBcc?.length) sendBody.bcc = normalizedBcc;
+      if (reply_to) sendBody.reply_to = reply_to;
+      if (in_reply_to) sendBody.in_reply_to = in_reply_to;
+      if (attachments?.length) sendBody.attachments = attachments;
 
       const result = await apiCall("POST", sendPath(), undefined, sendBody);
       return toolResult(result);
