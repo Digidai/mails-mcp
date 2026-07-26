@@ -1,6 +1,6 @@
 {
   "name": "mails-agent-mcp",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "MCP Server for mails-agent — email capabilities for AI agents",
   "type": "module",
   "main": "dist/index.js",
@@ -15,16 +15,24 @@
   },
   "keywords": [
     "mcp",
+    "email-mcp",
     "email",
     "ai-agent",
     "mails",
     "claude",
-    "cursor"
+    "claude-code",
+    "cursor",
+    "windsurf",
+    "otp",
+    "verification-code"
   ],
   "repository": "https://github.com/Digidai/mails-mcp",
   "homepage": "https://mails0.com",
   "author": "Gene Dai",
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^3.25.76"
@@ -35,5 +43,8 @@
   "devDependencies": {
     "@types/node": "^25.6.0",
     "vitest": "^4.1.5"
+  },
+  "overrides": {
+    "@hono/node-server": "^2.0.11"
   }
 }

@@ -1,19 +1,40 @@
 #!/usr/bin/env node
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, mkdirSync, readFileSync, existsSync, realpathSync, writeFileSync, } from "node:fs";
+import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-const CONFIG_PATH = join(homedir(), ".mails", "config.json");
+export const CONFIG_PATH = join(homedir(), ".mails", "config.json");
 export function loadConfig() {
-    if (!existsSync(CONFIG_PATH)) {
-        throw new Error("mails-agent not configured. Run: npm install -g mails-agent && mails claim <name>");
-    }
-    const raw = readFileSync(CONFIG_PATH, "utf-8");
-    return JSON.parse(raw);
+    const fileConfig = existsSync(CONFIG_PATH)
+        ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8"))
+        : {};
+    return {
+        ...fileConfig,
+        ...(process.env.MAILS_API_URL ? { worker_url: process.env.MAILS_API_URL } : {}),
+        ...(process.env.MAILS_API_KEY ? { api_key: process.env.MAILS_API_KEY } : {}),
+        ...(process.env.MAILS_WORKER_TOKEN ? { worker_token: process.env.MAILS_WORKER_TOKEN } : {}),
+        ...(process.env.MAILS_MAILBOX ? {
+            mailbox: process.env.MAILS_MAILBOX,
+            default_from: process.env.MAILS_MAILBOX,
+        } : {}),
+    };
+}
+export function saveConfig(values) {
+    const existing = existsSync(CONFIG_PATH)
+        ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8"))
+        : {};
+    const config = { ...existing, ...values };
+    const configDir = dirname(CONFIG_PATH);
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    chmodSync(configDir, 0o700);
+    writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+    chmodSync(CONFIG_PATH, 0o600);
+    _config = config;
+    return config;
 }
 // ---------------------------------------------------------------------------
 // HTTP helper
@@ -37,7 +58,8 @@ export function getToken() {
     const config = getConfig();
     const token = config.api_key || config.worker_token;
     if (!token) {
-        throw new Error("No API key or worker token found in ~/.mails/config.json. Run: mails claim <name>");
+        throw new Error("No API key or worker token found in ~/.mails/config.json. "
+            + "Retry the tool to bootstrap automatically, or run mails bootstrap");
     }
     return token;
 }
@@ -45,7 +67,8 @@ export function getMailbox() {
     const config = getConfig();
     const mailbox = config.mailbox || config.default_from;
     if (!mailbox) {
-        throw new Error("No mailbox configured in ~/.mails/config.json. Run: mails claim <name>");
+        throw new Error("No mailbox configured in ~/.mails/config.json. "
+            + "Retry the tool to bootstrap automatically, or run mails bootstrap");
     }
     return mailbox;
 }
@@ -83,6 +106,7 @@ export async function fetchWithTimeout(method, url, options) {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const headers = {
             Authorization: `Bearer ${getToken()}`,
+            ...mcpClientHeaders("mailbox-api"),
         };
         const fetchOptions = { method, headers };
         if (options?.body) {
@@ -135,6 +159,106 @@ export async function fetchWithTimeout(method, url, options) {
     }
     // Should not reach here, but satisfy TypeScript
     throw lastError ?? new Error("Request failed after retries");
+}
+function mcpClientHeaders(flow) {
+    return {
+        "X-Mails-Client": "mails-agent-mcp",
+        "X-Mails-Client-Version": PKG_VERSION,
+        "X-Mails-Source": "mcp",
+        "X-Mails-Flow": flow,
+    };
+}
+let bootstrapInFlight = null;
+export async function createTemporaryMailbox() {
+    if (!bootstrapInFlight) {
+        bootstrapInFlight = createTemporaryMailboxInternal();
+    }
+    try {
+        return await bootstrapInFlight;
+    }
+    finally {
+        bootstrapInFlight = null;
+    }
+}
+async function createTemporaryMailboxInternal() {
+    const config = getConfig();
+    const baseUrl = process.env.MAILS_API_URL || config.worker_url || "https://api.mails0.com";
+    if (config.api_key && (config.mailbox || config.default_from)) {
+        try {
+            const existing = await fetch(new URL("/v1/me", baseUrl), {
+                headers: {
+                    Authorization: `Bearer ${config.api_key}`,
+                    ...mcpClientHeaders("bootstrap-reuse"),
+                },
+            });
+            if (existing.ok) {
+                const me = await existing.json();
+                if (me.mailbox) {
+                    return {
+                        mailbox: me.mailbox,
+                        scope: me.scope || config.token_scope || "mailbox",
+                        expires_at: me.expires_at || config.token_expires_at || "",
+                        capabilities: me.capabilities || ["inbox.read", "email.read", "code.read"],
+                        reused: true,
+                        next_step: "Use get_inbox or wait_for_code. Claim a permanent mailbox at https://mails0.com.",
+                    };
+                }
+            }
+        }
+        catch {
+            // Invalid/expired local credentials fall through to a new provisional grant.
+        }
+    }
+    const idempotencyKey = config.bootstrap_idempotency_key || crypto.randomUUID();
+    if (!config.bootstrap_idempotency_key) {
+        saveConfig({ bootstrap_idempotency_key: idempotencyKey });
+    }
+    const response = await fetch(new URL("/v1/bootstrap", baseUrl), {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": idempotencyKey,
+            ...mcpClientHeaders("provisional-bootstrap"),
+        },
+        body: "{}",
+    });
+    const data = await response.json();
+    if (!response.ok || !data.mailbox || !data.api_key || !data.expires_at) {
+        throw new Error(data.error || `Bootstrap failed with HTTP ${response.status}`);
+    }
+    saveConfig({
+        worker_url: baseUrl,
+        api_key: data.api_key,
+        mailbox: data.mailbox,
+        default_from: data.mailbox,
+        token_scope: "provisional",
+        token_expires_at: data.expires_at,
+        bootstrap_idempotency_key: idempotencyKey,
+    });
+    const inbox = await fetch(new URL("/v1/inbox?limit=1", baseUrl), {
+        headers: {
+            Authorization: `Bearer ${data.api_key}`,
+            ...mcpClientHeaders("provisional-bootstrap"),
+        },
+    });
+    if (!inbox.ok) {
+        throw new Error(`Mailbox was created but the first inbox check failed with HTTP ${inbox.status}`);
+    }
+    return {
+        mailbox: data.mailbox,
+        scope: "provisional",
+        expires_at: data.expires_at,
+        capabilities: data.capabilities || ["inbox.read", "email.read", "code.read"],
+        reused: false,
+        next_step: "Use get_inbox or wait_for_code. Claim a permanent mailbox at https://mails0.com.",
+    };
+}
+export async function ensureMailboxConfigured() {
+    const config = getConfig();
+    if ((config.api_key || config.worker_token) && (config.mailbox || config.default_from)) {
+        return;
+    }
+    await createTemporaryMailbox();
 }
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -240,8 +364,16 @@ export const server = new McpServer({
     name: "mails-agent",
     version: PKG_VERSION,
 });
+server.tool("create_temporary_mailbox", "Create a random 72-hour receive-only mails0 mailbox without browser approval. The API key is stored locally and is never returned to the model. Call this when no mailbox is configured.", {}, async () => {
+    try {
+        return toolResult(await createTemporaryMailbox());
+    }
+    catch (err) {
+        return toolError(err);
+    }
+});
 // 1. send_email
-server.tool("send_email", "Send an email from your mails-agent mailbox", {
+server.tool("send_email", "Send an email from a permanent mails-agent mailbox. With no configuration, a safe temporary mailbox is created first and the API explains how to upgrade.", {
     to: emailListSchema,
     cc: emailListSchema.optional().describe("CC recipient email address or addresses"),
     bcc: emailListSchema.optional().describe("BCC recipient email address or addresses"),
@@ -259,6 +391,7 @@ server.tool("send_email", "Send an email from your mails-agent mailbox", {
         .describe("Optional base64-encoded attachments"),
 }, async ({ to, cc, bcc, subject, body, html, reply_to, in_reply_to, attachments }) => {
     try {
+        await ensureMailboxConfigured();
         const sendBody = {
             from: getMailbox(),
             to: normalizeEmailList(to),
@@ -311,6 +444,7 @@ server.tool("get_inbox", "List recent emails in your mailbox", {
         .describe("Search mode: keyword (FTS5), semantic (vector), hybrid (both). Default: keyword"),
 }, async ({ limit, query, direction, label, mode }) => {
     try {
+        await ensureMailboxConfigured();
         const params = withMailbox({ limit, query, direction, label, mode });
         const result = await apiCall("GET", inboxPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
         return toolResult(result);
@@ -337,6 +471,7 @@ server.tool("search_inbox", "Search emails in your mailbox by keyword, semantic 
         .describe("Search mode: keyword (FTS5), semantic (vector), hybrid (both). Default: keyword"),
 }, async ({ query, limit, label, mode }) => {
     try {
+        await ensureMailboxConfigured();
         const params = withMailbox({ query, limit, label, mode });
         const result = await apiCall("GET", inboxPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
         return toolResult(result);
@@ -350,6 +485,7 @@ server.tool("get_email", "Get full details of a specific email by its ID", {
     id: z.string().describe("Email ID"),
 }, async ({ id }) => {
     try {
+        await ensureMailboxConfigured();
         const result = await apiCall("GET", emailPath(), { id }, undefined, DEFAULT_TIMEOUT_MS, true);
         return toolResult(result);
     }
@@ -370,6 +506,7 @@ server.tool("wait_for_code", "Wait for a verification code email to arrive (poll
         .describe("Only return codes received after this ISO timestamp (e.g. 2026-03-27T10:00:00Z)"),
 }, async ({ timeout, since }) => {
     try {
+        await ensureMailboxConfigured();
         const params = withMailbox({ timeout, since });
         // Server-side timeout up to 55s; give client extra buffer
         const clientTimeoutMs = (Math.min(timeout, 55) + 10) * 1000;
@@ -388,6 +525,7 @@ server.tool("delete_email", "Delete an email by its ID", {
     id: z.string().describe("Email ID to delete"),
 }, async ({ id }) => {
     try {
+        await ensureMailboxConfigured();
         await apiCall("DELETE", emailPath(), { id });
         return toolResult({ deleted: true, id });
     }
@@ -405,6 +543,7 @@ server.tool("get_attachment", "Download an attachment by its ID (returns text co
     id: z.string().describe("Attachment ID"),
 }, async ({ id }) => {
     try {
+        await ensureMailboxConfigured();
         const url = buildUrl(attachmentPath(), { id });
         const res = await fetchWithTimeout("GET", url);
         const contentType = res.headers.get("Content-Type") || "application/octet-stream";
@@ -435,6 +574,7 @@ server.tool("get_threads", "List email threads in your mailbox", {
         .describe("Maximum number of threads to return (default 20)"),
 }, async ({ limit }) => {
     try {
+        await ensureMailboxConfigured();
         const params = withMailbox({ limit });
         const result = await apiCall("GET", threadsPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
         return toolResult(result);
@@ -448,6 +588,7 @@ server.tool("get_thread", "Get all emails in a specific thread", {
     id: z.string().describe("Thread ID"),
 }, async ({ id }) => {
     try {
+        await ensureMailboxConfigured();
         const params = withMailbox({ id });
         const result = await apiCall("GET", threadPath(), params, undefined, DEFAULT_TIMEOUT_MS, true);
         return toolResult(result);
@@ -464,6 +605,7 @@ server.tool("extract_data", "Extract structured data from an email (order, shipp
         .describe("Type of data to extract"),
 }, async ({ email_id, type }) => {
     try {
+        await ensureMailboxConfigured();
         const result = await apiCall("POST", extractPath(), undefined, {
             email_id,
             type,
@@ -482,7 +624,18 @@ export async function main() {
     await server.connect(transport);
 }
 // Only start when executed directly (not imported for testing)
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+function isDirectExecution() {
+    if (!process.argv[1])
+        return false;
+    const modulePath = fileURLToPath(import.meta.url);
+    try {
+        return realpathSync(process.argv[1]) === realpathSync(modulePath);
+    }
+    catch {
+        return resolve(process.argv[1]) === resolve(modulePath);
+    }
+}
+if (isDirectExecution()) {
     main().catch((err) => {
         console.error("Fatal error:", err);
         process.exit(1);

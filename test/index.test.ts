@@ -4,9 +4,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 vi.mock("node:fs", () => ({
   readFileSync: vi.fn(),
   existsSync: vi.fn(),
+  mkdirSync: vi.fn(),
+  writeFileSync: vi.fn(),
+  chmodSync: vi.fn(),
+  realpathSync: vi.fn((value: string) => value),
 }));
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, chmodSync } from "node:fs";
 import {
   resetConfig,
   getConfig,
@@ -22,6 +26,8 @@ import {
   toolError,
   log,
   server,
+  createTemporaryMailbox,
+  ensureMailboxConfigured,
 } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
@@ -46,6 +52,13 @@ function mockResponse(body: unknown, init?: { status?: number; headers?: Record<
   return new Response(text, { status, statusText: status === 200 ? "OK" : "Error", headers });
 }
 
+afterEach(() => {
+  delete process.env.MAILS_API_URL;
+  delete process.env.MAILS_API_KEY;
+  delete process.env.MAILS_MAILBOX;
+  delete process.env.MAILS_WORKER_TOKEN;
+});
+
 // ---------------------------------------------------------------------------
 // Config Layer
 // ---------------------------------------------------------------------------
@@ -54,12 +67,16 @@ describe("Config", () => {
   beforeEach(() => {
     resetConfig();
     vi.restoreAllMocks();
+    delete process.env.MAILS_API_URL;
+    delete process.env.MAILS_API_KEY;
+    delete process.env.MAILS_MAILBOX;
+    delete process.env.MAILS_WORKER_TOKEN;
   });
 
-  it("loadConfig throws when config file missing", () => {
+  it("loads an empty config when the file is missing so bootstrap remains available", () => {
     vi.mocked(existsSync).mockReturnValue(false);
     resetConfig();
-    expect(() => getConfig()).toThrow("mails-agent not configured");
+    expect(getConfig()).toEqual({});
   });
 
   it("loadConfig parses valid JSON", () => {
@@ -83,6 +100,20 @@ describe("Config", () => {
     resetConfig();
     setConfig({ api_key: "k2", mailbox: "m@test.com" });
     expect(getConfig().api_key).toBe("k2");
+  });
+
+  it("reads the documented MCP environment variables", () => {
+    vi.mocked(existsSync).mockReturnValue(false);
+    process.env.MAILS_API_URL = "https://api.example.com";
+    process.env.MAILS_API_KEY = "env-key";
+    process.env.MAILS_MAILBOX = "env@mails0.com";
+    resetConfig();
+    expect(getConfig()).toMatchObject({
+      worker_url: "https://api.example.com",
+      api_key: "env-key",
+      mailbox: "env@mails0.com",
+      default_from: "env@mails0.com",
+    });
   });
 });
 
@@ -258,6 +289,8 @@ describe("fetchWithTimeout", () => {
     await fetchWithTimeout("GET", url);
     const [, opts] = fetchMock.mock.calls[0];
     expect(opts.headers.Authorization).toBe("Bearer test-token");
+    expect(opts.headers["X-Mails-Client"]).toBe("mails-agent-mcp");
+    expect(opts.headers["X-Mails-Client-Version"]).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
   it("throws on HTTP 4xx without retry", async () => {
@@ -331,6 +364,82 @@ describe("fetchWithTimeout", () => {
     mockFetch(res);
     const url = new URL("https://example.com/v1/inbox");
     await expect(fetchWithTimeout("GET", url)).rejects.toThrow("API error (403): Forbidden");
+  });
+});
+
+describe("Automatic provisional mailbox bootstrap", () => {
+  beforeEach(() => {
+    resetConfig();
+    vi.restoreAllMocks();
+    vi.mocked(existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("stores the API key locally but never returns it to the model", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(mockResponse({
+        mailbox: "agent-abc123@mails0.com",
+        api_key: "mk_secret_value",
+        scope: "provisional",
+        expires_at: "2026-07-29T00:00:00.000Z",
+        capabilities: ["inbox.read", "code.read"],
+      }, { status: 201 }))
+      .mockResolvedValueOnce(mockResponse({ emails: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await createTemporaryMailbox();
+    expect(result.mailbox).toBe("agent-abc123@mails0.com");
+    expect(JSON.stringify(result)).not.toContain("mk_secret_value");
+    expect(vi.mocked(writeFileSync)).toHaveBeenCalled();
+    const writes = vi.mocked(writeFileSync).mock.calls;
+    expect(writes.some((call) => String(call[1]).includes("mk_secret_value"))).toBe(true);
+    expect(vi.mocked(chmodSync)).toHaveBeenCalledWith(expect.any(String), 0o600);
+
+    const bootstrapOptions = fetchMock.mock.calls[0][1] as RequestInit;
+    expect((bootstrapOptions.headers as Record<string, string>)["Idempotency-Key"]).toBeTruthy();
+    expect((bootstrapOptions.headers as Record<string, string>)["X-Mails-Client"]).toBe("mails-agent-mcp");
+  });
+
+  it("lazily bootstraps when another mailbox tool is called without config", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(mockResponse({
+        mailbox: "agent-lazy@mails0.com",
+        api_key: "mk_lazy_secret",
+        scope: "provisional",
+        expires_at: "2026-07-29T00:00:00.000Z",
+        capabilities: ["inbox.read", "code.read"],
+      }, { status: 201 }))
+      .mockResolvedValueOnce(mockResponse({ emails: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await ensureMailboxConfigured();
+    expect(getConfig()).toMatchObject({
+      mailbox: "agent-lazy@mails0.com",
+      token_scope: "provisional",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("deduplicates concurrent bootstrap attempts", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(mockResponse({
+        mailbox: "agent-concurrent@mails0.com",
+        api_key: "mk_concurrent_secret",
+        scope: "provisional",
+        expires_at: "2026-07-29T00:00:00.000Z",
+      }, { status: 201 }))
+      .mockResolvedValueOnce(mockResponse({ emails: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const [first, second] = await Promise.all([
+      createTemporaryMailbox(),
+      createTemporaryMailbox(),
+    ]);
+    expect(first.mailbox).toBe(second.mailbox);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

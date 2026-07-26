@@ -6,8 +6,13 @@ export interface MailsConfig {
     api_key?: string;
     mailbox?: string;
     default_from?: string;
+    token_scope?: "operator" | "mailbox" | "provisional";
+    token_expires_at?: string;
+    bootstrap_idempotency_key?: string;
 }
+export declare const CONFIG_PATH: string;
 export declare function loadConfig(): MailsConfig;
+export declare function saveConfig(values: Partial<MailsConfig>): MailsConfig;
 export declare let _config: MailsConfig | null;
 /** Reset cached config (for testing) */
 export declare function resetConfig(): void;
@@ -35,6 +40,16 @@ export declare function fetchWithTimeout(method: string, url: URL, options?: {
     timeoutMs?: number;
     retry?: boolean;
 }): Promise<Response>;
+export type TemporaryMailboxResult = {
+    mailbox: string;
+    scope: "operator" | "mailbox" | "provisional";
+    expires_at: string;
+    capabilities: string[];
+    reused: boolean;
+    next_step: string;
+};
+export declare function createTemporaryMailbox(): Promise<TemporaryMailboxResult>;
+export declare function ensureMailboxConfigured(): Promise<void>;
 /** Build a full URL with query params for the mails API */
 export declare function buildUrl(path: string, params?: Record<string, string | number | undefined>): URL;
 export declare function apiCall(method: string, path: string, params?: Record<string, string | number | undefined>, body?: unknown, timeoutMs?: number, retry?: boolean): Promise<unknown>;
